@@ -1,83 +1,109 @@
-#include <esp_now.h>
 #include <WiFi.h>
+#include <esp_now.h>
+#include <ESP32Servo.h>
 
-#ifndef LED_BUILTIN
-#define LED_BUILTIN 2
-#endif
+// Pin definitions
+const int PIN_STBY = 22;
+const int PIN_AIN1 = 26;
+const int PIN_AIN2 = 27;
+const int PIN_SERVO = 18;
 
-// Define Motor Driver Control Pins
-#define MOTOR1_IN1 16
-#define MOTOR1_IN2 17
-#define MOTOR2_IN1 18
-#define MOTOR2_IN2 19
+// LEDC Channels for PWM
+const int CHANNEL_AIN1 = 0;
+const int CHANNEL_AIN2 = 1;
 
-struct DataPacket {
-    uint16_t pot[4];
-};
+Servo steeringServo;
 
-DataPacket receivedData;
+// Mirror data structure
+struct ControlData {
+  int16_t joy1_x;
+  int16_t joy1_y;
+  bool joy1_btn;
+  int16_t joy2_x;
+  int16_t joy2_y;
+  bool joy2_btn;
+} incomingData;
 
-// Updated callback signature with (const uint8_t * mac_addr, ...)
-void OnDataRecv(const uint8_t * mac_addr, const uint8_t * incomingData, int len) {
-    memcpy(&receivedData, incomingData, sizeof(receivedData));
+// Fail-safe (watchdog) variables
+unsigned long lastReceiveTime = 0;
+const unsigned long FAILSAFE_TIMEOUT = 500; // Stop if no signal for 500ms
 
-    // Toggle onboard LED on every incoming message to verify signal reception
-    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+void stopMotors() {
+  ledcWrite(CHANNEL_AIN1, 0);
+  ledcWrite(CHANNEL_AIN2, 0);
+}
 
-    // Motor 1 Control (Potentiometer 0)
-    int raw1 = receivedData.pot[0];
-    if (raw1 > 2150) { // Forward
-        int pwmVal = map(raw1, 2150, 4095, 0, 255);
-        analogWrite(MOTOR1_IN1, pwmVal);
-        analogWrite(MOTOR1_IN2, 0);
-    } else if (raw1 < 1950) { // Reverse
-        int pwmVal = map(raw1, 1950, 0, 0, 255);
-        analogWrite(MOTOR1_IN1, 0);
-        analogWrite(MOTOR1_IN2, pwmVal);
-    } else { // Deadzone / Stop
-        analogWrite(MOTOR1_IN1, 0);
-        analogWrite(MOTOR1_IN2, 0);
-    }
+void driveMotor(int16_t throttle) {
+  // throttle ranges from -100 to 100
+  if (throttle > 0) {
+    int pwmVal = map(throttle, 0, 100, 0, 255);
+    ledcWrite(CHANNEL_AIN1, pwmVal);
+    ledcWrite(CHANNEL_AIN2, 0);
+  } else if (throttle < 0) {
+    int pwmVal = map(abs(throttle), 0, 100, 0, 255);
+    ledcWrite(CHANNEL_AIN1, 0);
+    ledcWrite(CHANNEL_AIN2, pwmVal);
+  } else {
+    stopMotors();
+  }
+}
 
-    // Motor 2 Control (Potentiometer 1)
-    int raw2 = receivedData.pot[1];
-    if (raw2 > 2150) { // Forward
-        int pwmVal = map(raw2, 2150, 4095, 0, 255);
-        analogWrite(MOTOR2_IN1, pwmVal);
-        analogWrite(MOTOR2_IN2, 0);
-    } else if (raw2 < 1950) { // Reverse
-        int pwmVal = map(raw2, 1950, 0, 0, 255);
-        analogWrite(MOTOR2_IN1, 0);
-        analogWrite(MOTOR2_IN2, pwmVal);
-    } else { // Deadzone / Stop
-        analogWrite(MOTOR2_IN1, 0);
-        analogWrite(MOTOR2_IN2, 0);
-    }
+// Callback using the classic ESP-NOW signature (compatible with older ESP-IDF frameworks)
+void OnDataRecv(const uint8_t *mac, const uint8_t *incomingDataPtr, int len) {
+  memcpy(&incomingData, incomingDataPtr, sizeof(incomingData));
+  lastReceiveTime = millis(); // Refresh timeout tracker
 
-    Serial.printf("[RX] Received Pots: [%d, %d, %d, %d]\n", 
-                  receivedData.pot[0], receivedData.pot[1], receivedData.pot[2], receivedData.pot[3]);
+  // Drive motor using Joystick 1 Y-axis
+  driveMotor(incomingData.joy1_y);
+
+  // Steer servo using Joystick 2 X-axis (mapped from -100/100 to 0/180 degrees)
+  int servoAngle = map(incomingData.joy2_x, -100, 100, 0, 180);
+  steeringServo.write(servoAngle);
 }
 
 void setup() {
-    Serial.begin(115200);
+  Serial.begin(115200);
+  delay(1000); // Give the serial monitor a moment to initialize
 
-    pinMode(LED_BUILTIN, OUTPUT);
-    pinMode(MOTOR1_IN1, OUTPUT);
-    pinMode(MOTOR1_IN2, OUTPUT);
-    pinMode(MOTOR2_IN1, OUTPUT);
-    pinMode(MOTOR2_IN2, OUTPUT);
+  // 1. Initialize Wi-Fi in Station Mode (Required for ESP-NOW and MAC reading)
+  WiFi.mode(WIFI_STA);
 
-    WiFi.mode(WIFI_STA);
+  // Print the MAC Address to the Serial Monitor
+  Serial.println();
+  Serial.print("Vehicle ESP32 MAC Address: ");
+  Serial.println(WiFi.macAddress());
+  Serial.println();
 
-    if (esp_now_init() != ESP_OK) {
-        Serial.println("ESP-NOW Init Failed");
-        return;
-    }
+  // 2. Initialize H-Bridge Standby Pin HIGH
+  pinMode(PIN_STBY, OUTPUT);
+  digitalWrite(PIN_STBY, HIGH);
 
-    esp_now_register_recv_cb(OnDataRecv);
-    Serial.println("Receiver Ready.");
+  // 3. Setup classic LEDC channels for AIN1 & AIN2
+  ledcSetup(CHANNEL_AIN1, 5000, 8); // 5 kHz frequency, 8-bit resolution
+  ledcAttachPin(PIN_AIN1, CHANNEL_AIN1);
+  
+  ledcSetup(CHANNEL_AIN2, 5000, 8);
+  ledcAttachPin(PIN_AIN2, CHANNEL_AIN2);
+  
+  stopMotors();
+
+  // 4. Setup Micro Servo
+  steeringServo.attach(PIN_SERVO);
+  steeringServo.write(90); // Center position on boot
+
+  // 5. Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+
+  esp_now_register_recv_cb(OnDataRecv);
 }
 
 void loop() {
-    // All receiver logic is handled inside OnDataRecv callback
+  // Fail-Safe Watchdog: cuts motor power and centers steering if connection drops
+  if (millis() - lastReceiveTime > FAILSAFE_TIMEOUT) {
+    stopMotors();
+    steeringServo.write(90); // Center steering
+  }
 }

@@ -1,69 +1,90 @@
-#include <esp_now.h>
 #include <WiFi.h>
+#include <esp_now.h>
 
-#ifndef LED_BUILTIN
-#define LED_BUILTIN 2 // GPIO 2 is standard on most ESP32 dev boards (GPIO 4 on some)
-#endif
+// REPLACE with your Vehicle ESP32's MAC Address
+uint8_t vehicleAddress[] = {0x70, 0x4b, 0xca, 0x04, 0x5d, 0x58};
 
-// Define ADC pins for 4 Potentiometers (Use ADC1 pins: GPIO 32, 33, 34, 35)
-const int POT_PINS[4] = {34, 35, 32, 33};
+// Pin definitions
+const int PIN_JOY1_X = 34;
+const int PIN_JOY1_Y = 35;
+const int PIN_JOY1_BTN = 32;
+const int PIN_JOY2_X = 33;
+const int PIN_JOY2_Y = 36;
+const int PIN_JOY2_BTN = 25;
 
-struct DataPacket {
-    uint16_t pot[4];
-};
+// Data packet structure
+struct ControlData {
+  int16_t joy1_x;
+  int16_t joy1_y;
+  bool joy1_btn;
+  int16_t joy2_x;
+  int16_t joy2_y;
+  bool joy2_btn;
+} myData;
 
-DataPacket sensorData;
+esp_now_peer_info_t peerInfo;
 
-// Broadcast address (Sends to all listening devices)
-uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+// Deadzone function: takes raw ADC (0-4095), maps to -100 to 100, and filters out noise
+int16_t applyDeadzone(int rawValue, int deadzonePercent) {
+  int val = map(rawValue, 0, 4095, -100, 100);
+  if (abs(val) < deadzonePercent) {
+    return 0;
+  }
+  // Rescale the active range past the deadzone to full 0-100 magnitude
+  if (val > 0) {
+    return map(val, deadzonePercent, 100, 0, 100);
+  } else {
+    return map(val, -deadzonePercent, -100, 0, -100);
+  }
+}
 
 void setup() {
-    Serial.begin(115200);
-    pinMode(LED_BUILTIN, OUTPUT);
+  Serial.begin(115200);
 
-    WiFi.mode(WIFI_STA);
+  pinMode(PIN_JOY1_BTN, INPUT_PULLUP);
+  pinMode(PIN_JOY2_BTN, INPUT_PULLUP);
 
-    if (esp_now_init() != ESP_OK) {
-        Serial.println("ESP-NOW Init Failed");
-        return;
-    }
+  WiFi.mode(WIFI_STA);
 
-    esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-    peerInfo.channel = 0;  
-    peerInfo.encrypt = false;
-    
-    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-        Serial.println("Failed to add peer");
-        return;
-    }
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
 
-    for (int i = 0; i < 4; i++) {
-        pinMode(POT_PINS[i], INPUT);
-    }
-
-    Serial.println("Transmitter Ready.");
+  // Register peer
+  memcpy(peerInfo.peer_addr, vehicleAddress, 6);
+  peerInfo.channel = 0;  
+  peerInfo.encrypt = false;
+  
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("Failed to add peer");
+    return;
+  }
 }
 
 void loop() {
-    // Read all 4 potentiometers
-    for (int i = 0; i < 4; i++) {
-        sensorData.pot[i] = analogRead(POT_PINS[i]);
-    }
+  // Read joysticks with a 10% deadzone applied
+  myData.joy1_x = applyDeadzone(analogRead(PIN_JOY1_X), 10);
+  myData.joy1_y = applyDeadzone(analogRead(PIN_JOY1_Y), 10);
+  myData.joy1_btn = !digitalRead(PIN_JOY1_BTN); // Active low button
+  
+  myData.joy2_x = applyDeadzone(analogRead(PIN_JOY2_X), 10);
+  myData.joy2_y = applyDeadzone(analogRead(PIN_JOY2_Y), 10);
+  myData.joy2_btn = !digitalRead(PIN_JOY2_BTN); // Active low button
 
-    // Transmit data packet over ESP-NOW
-    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &sensorData, sizeof(sensorData));
+  // Print transmitted data to Serial Monitor
+  Serial.print("TX -> J1 X: "); Serial.print(myData.joy1_x);
+  Serial.print(" | Y: "); Serial.print(myData.joy1_y);
+  Serial.print(" | B1: "); Serial.print(myData.joy1_btn);
+  Serial.print(" || J2 X: "); Serial.print(myData.joy2_x);
+  Serial.print(" | Y: "); Serial.print(myData.joy2_y);
+  Serial.print(" | B2: "); Serial.println(myData.joy2_btn);
 
-    if (result == ESP_OK) {
-        // Blink LED briefly to verify transmitter activity
-        digitalWrite(LED_BUILTIN, HIGH);
-        delay(10);
-        digitalWrite(LED_BUILTIN, LOW);
-        
-        Serial.printf("[TX] Sent: %d, %d, %d, %d\n", sensorData.pot[0], sensorData.pot[1], sensorData.pot[2], sensorData.pot[3]);
-    } else {
-        Serial.println("[TX] Error sending data");
-    }
+  // Send data via ESP-NOW
+  esp_err_t result = esp_now_send(vehicleAddress, (uint8_t *) &myData, sizeof(myData));
+  if (result != ESP_OK) {
+    // Serial.println("Error sending data");
+  }
 
-    delay(90); // Total loop delay ~100ms
+  delay(20); // Send interval (~50fps)
 }

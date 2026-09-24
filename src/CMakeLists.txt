@@ -1,1 +1,1 @@
-idf_component_register(SRCS "vehicle.cpp")
+idf_component_register(SRCS "controller.cpp")
